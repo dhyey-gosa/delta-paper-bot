@@ -136,8 +136,8 @@ class PaperExchange:
             log.error(f"Fetch error {symbol}: {e}")
             return []
 
-    def fetch_ticker_price(self, symbol, exchange_name):
-        ex = self._get_exchange(name)
+    def fetch_ticker_price(self, symbol, exchange_name, mtype='spot'):
+        ex = self._get_exchange(exchange_name, mtype)
         try:
             t = ex.fetch_ticker(symbol)
             return t['last']
@@ -402,10 +402,14 @@ def create_app():
 
 
 # === MAIN ===
+app = create_app()
+
+# Start bot thread at module level (for gunicorn)
+_bot_thread = threading.Thread(target=bot.run, daemon=True)
+_bot_thread.start()
+log.info("Bot thread started at module level")
+
 if __name__ == '__main__':
-    t = threading.Thread(target=bot.run, daemon=True)
-    t.start()
-    app = create_app()
     port = int(os.environ.get('PORT', 8080))
     log.info(f"Flask on port {port}")
     app.run(host='0.0.0.0', port=port, debug=False)
