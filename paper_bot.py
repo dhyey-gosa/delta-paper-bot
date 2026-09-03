@@ -374,7 +374,6 @@ class PaperBot:
         log.info("=" * 60)
         log.info("PAPER FORWARD BOT STARTING (Delta Exchange API)")
         log.info("=" * 60)
-        self.setup()
         self.running = True
         cycle = 0
 
@@ -406,12 +405,17 @@ class PaperBot:
 bot = PaperBot()
 bot.setup()  # Initialize states at module level so Flask routes work immediately
 
+# Shared mutable state - thread writes, Flask reads
+_shared = {'bot': bot}
+
 def create_app():
     from flask import Flask, jsonify
     app = Flask(__name__)
+    app.bot = bot  # Bind bot to Flask app instance
 
     @app.route('/')
     def index():
+        b = app.bot
         return jsonify({
             'status': 'running',
             'bot': 'Delta Paper Forward Test',
@@ -424,30 +428,32 @@ def create_app():
                 'fees': f'{FEE_PER_SIDE*100:.2f}%/side',
                 'capital_per_asset': '100 INR',
             },
-            'uptime_since': bot.start_time,
-            'assets': {str(s): st.to_dict() for s, st in bot.states.items()},
+            'uptime_since': b.start_time,
+            'assets': {str(s): st.to_dict() for s, st in b.states.items()},
         })
 
     @app.route('/status')
     def status():
-        total_pnl = sum(s.total_pnl for s in bot.states.values())
-        total_trades = sum(len(s.trades) for s in bot.states.values())
-        total_wins = sum(s.win_count for s in bot.states.values())
+        b = app.bot
+        total_pnl = sum(s.total_pnl for s in b.states.values())
+        total_trades = sum(len(s.trades) for s in b.states.values())
+        total_wins = sum(s.win_count for s in b.states.values())
         return jsonify({
             'status': 'ok',
-            'uptime': bot.start_time,
+            'uptime': b.start_time,
             'summary': {
                 'total_pnl': round(total_pnl, 4),
                 'total_trades': total_trades,
                 'total_wins': total_wins,
                 'overall_win_rate': round(total_wins / max(1, total_trades) * 100, 1),
             },
-            'assets': {str(s): st.to_dict() for s, st in bot.states.items()},
+            'assets': {str(s): st.to_dict() for s, st in b.states.items()},
         })
 
     @app.route('/trades')
     def trades():
-        return jsonify({str(s): st.trades[-20:] for s, st in bot.states.items()})
+        b = app.bot
+        return jsonify({str(s): st.trades[-20:] for s, st in b.states.items()})
 
     @app.route('/health')
     def health():
