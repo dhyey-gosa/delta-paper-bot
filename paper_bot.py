@@ -1,10 +1,11 @@
 """
 Delta Exchange Paper Forward Test Bot
-Live prices via ccxt, paper trading with 100 INR per asset, 50x leverage.
+Live prices via Delta Exchange public API, paper trading with 100 INR per asset, 50x leverage.
 Deployed on Render, kept alive by UptimeRobot.
 
-Assets: XAUT/USDT (gold), XAG/USDT (silver), DOGE/USDT
+Assets: XAUTUSD (gold), SLVONUSD (silver), DOGEUSD
 Strategy: VWAP Pullback Scalper on 1min
+Product IDs: XAUTUSD=131253, SLVONUSD=124058, DOGEUSD=14745
 """
 import os
 import sys
@@ -15,24 +16,25 @@ import threading
 from datetime import datetime, timezone
 from collections import deque
 
-import ccxt
 import numpy as np
+import requests
 
 # === CONFIG ===
+API_BASE = 'https://api.india.delta.exchange'
+
 ASSETS = {
-    'XAUT/USDT':  {'capital_inr': 100, 'leverage': 50, 'exchange': 'binance', 'type': 'spot'},
-    'XAG/USDT':   {'capital_inr': 100, 'leverage': 50, 'exchange': 'binance', 'type': 'future'},
-    'DOGE/USDT':  {'capital_inr': 100, 'leverage': 50, 'exchange': 'binance', 'type': 'spot'},
+    131253: {'symbol': 'XAUTUSD', 'name': 'Gold (XAUT)',  'capital_inr': 100, 'leverage': 50, 'tick': 0.01},
+    124058: {'symbol': 'SLVONUSD', 'name': 'Silver (SLV)','capital_inr': 100, 'leverage': 50, 'tick': 0.001},
+    14745:  {'symbol': 'DOGEUSD', 'name': 'DOGE',         'capital_inr': 100, 'leverage': 50, 'tick': 0.00001},
 }
 
-# Strategy params
+# Strategy params (validated best config)
 TARGET_PCT = 0.0020   # 0.20%
 STOP_PCT = 0.0015     # 0.15%
 FEE_PER_SIDE = 0.0001  # 0.01%
 COOLDOWN_BARS = 0
 
-# How often to fetch candles (seconds)
-FETCH_INTERVAL = 15
+FETCH_INTERVAL = 15  # seconds
 
 # === LOGGING ===
 logging.basicConfig(
@@ -41,6 +43,57 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)]
 )
 log = logging.getLogger('paper_bot')
+
+
+# === DELTA PUBLIC API (no auth needed) ===
+class DeltaPublicAPI:
+    def __init__(self, base_url=API_BASE):
+        self.base_url = base_url
+        self.session = requests.Session()
+        self.session.headers.update({'User-Agent': 'DeltaPaperBot/1.0'})
+
+    def get_candles(self, symbol, resolution='1m', limit=200):
+        """Fetch candles from Delta public API using symbol + start/end timestamps"""
+        import time as _time
+        end = int(_time.time())
+        # Calculate start based on resolution and limit
+        resolution_seconds = {
+            '1m': 60, '3m': 180, '5m': 300, '15m': 900,
+            '30m': 1800, '1h': 3600, '4h': 14400, '1d': 86400,
+        }
+        secs = resolution_seconds.get(resolution, 60)
+        start = end - (secs * limit)
+
+        url = f"{self.base_url}/v2/history/candles"
+        params = {
+            'resolution': resolution,
+            'symbol': symbol,
+            'start': start,
+            'end': end,
+        }
+        try:
+            r = self.session.get(url, params=params, timeout=15)
+            r.raise_for_status()
+            data = r.json()
+            if isinstance(data, dict) and 'result' in data:
+                return data['result'][-limit:]
+            elif isinstance(data, list):
+                return data[-limit:]
+            return []
+        except Exception as e:
+            log.error(f"Candle fetch error {symbol} {resolution}: {e}")
+            return []
+
+    def get_ticker(self, symbol):
+        """Fetch current ticker"""
+        url = f"{self.base_url}/v2/tickers/{symbol}"
+        try:
+            r = self.session.get(url, timeout=10)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            log.error(f"Ticker fetch error {symbol}: {e}")
+            return None
 
 
 # === INDICATORS (numpy, no deps) ===
@@ -54,6 +107,8 @@ def ema_np(arr, n):
 
 def sma_np(arr, n):
     out = np.full(len(arr), np.nan, dtype=float)
+    if len(arr) < n:
+        return out
     cs = np.cumsum(arr)
     out[n-1:] = (cs[n-1:] - np.concatenate([[0], cs[:-n]])) / n
     return out
@@ -76,8 +131,10 @@ def rsi_np(arr, n=14):
 
 # === ASSET STATE ===
 class AssetState:
-    def __init__(self, symbol, capital, leverage):
+    def __init__(self, product_id, symbol, name, capital, leverage):
+        self.product_id = product_id
         self.symbol = symbol
+        self.name = name
         self.capital = capital
         self.initial_capital = capital
         self.leverage = leverage
@@ -95,7 +152,9 @@ class AssetState:
 
     def to_dict(self):
         return {
+            'product_id': self.product_id,
             'symbol': self.symbol,
+            'name': self.name,
             'capital': round(self.capital, 2),
             'initial_capital': self.initial_capital,
             'leverage': self.leverage,
@@ -111,38 +170,6 @@ class AssetState:
             'recent_trades': self.trades[-5:],
             'errors': self.errors[-3:],
         }
-
-
-# === PAPER EXCHANGE ===
-class PaperExchange:
-    def __init__(self):
-        self.exchanges = {}
-
-    def _get_exchange(self, name, mtype='spot'):
-        key = f"{name}_{mtype}"
-        if key not in self.exchanges:
-            opts = {'enableRateLimit': True}
-            if mtype == 'future':
-                opts['options'] = {'defaultType': 'future'}
-            self.exchanges[key] = ccxt.binance(opts)
-        return self.exchanges[key]
-
-    def fetch_ohlcv(self, symbol, exchange_name, timeframe='1m', limit=200, mtype='spot'):
-        ex = self._get_exchange(exchange_name, mtype)
-        try:
-            data = ex.fetch_ohlcv(symbol, timeframe, limit=limit)
-            return data
-        except Exception as e:
-            log.error(f"Fetch error {symbol}: {e}")
-            return []
-
-    def fetch_ticker_price(self, symbol, exchange_name, mtype='spot'):
-        ex = self._get_exchange(exchange_name, mtype)
-        try:
-            t = ex.fetch_ticker(symbol)
-            return t['last']
-        except:
-            return None
 
 
 # === STRATEGY ===
@@ -251,35 +278,44 @@ def check_exit(state, current_candle):
 # === BOT ===
 class PaperBot:
     def __init__(self):
-        self.exchange = PaperExchange()
+        self.api = DeltaPublicAPI()
         self.states = {}
         self.running = False
         self.start_time = datetime.now(timezone.utc).isoformat()
         self.log_lines = deque(maxlen=200)
 
     def setup(self):
-        for sym, cfg in ASSETS.items():
-            state = AssetState(sym, cfg['capital_inr'], cfg['leverage'])
-            self.states[sym] = state
-            log.info(f"  {sym}: capital={cfg['capital_inr']} INR, leverage={cfg['leverage']}x")
+        for pid, cfg in ASSETS.items():
+            state = AssetState(pid, cfg['symbol'], cfg['name'], cfg['capital_inr'], cfg['leverage'])
+            self.states[pid] = state
+            log.info(f"  {cfg['symbol']} (id={pid}): capital={cfg['capital_inr']} INR, leverage={cfg['leverage']}x")
         return True
 
-    def fetch_candles(self, symbol, state):
-        cfg = ASSETS[symbol]
-        mtype = cfg.get('type', 'spot')
-        data_1m = self.exchange.fetch_ohlcv(symbol, cfg['exchange'], '1m', 200, mtype)
-        if not data_1m:
+    def fetch_candles(self, state):
+        # 1min candles
+        raw_1m = self.api.get_candles(state.symbol, '1m', 200)
+        if not raw_1m:
             return
-        state.candles_1m = [(d[1], d[2], d[3], d[4], d[5]) for d in data_1m]
-        state.last_price = data_1m[-1][4]
+        # Parse: {time, open, high, low, close, volume}
+        state.candles_1m = [
+            (float(c['open']), float(c['high']), float(c['low']),
+             float(c['close']), float(c['volume']))
+            for c in raw_1m
+        ]
+        state.last_price = float(raw_1m[-1]['close'])
 
-        data_15m = self.exchange.fetch_ohlcv(symbol, cfg['exchange'], '15m', 100, mtype)
-        if data_15m:
-            state.candles_15m = [(d[1], d[2], d[3], d[4], d[5]) for d in data_15m]
+        # 15min candles
+        raw_15m = self.api.get_candles(state.symbol, '15m', 100)
+        if raw_15m:
+            state.candles_15m = [
+                (float(c['open']), float(c['high']), float(c['low']),
+                 float(c['close']), float(c['volume']))
+                for c in raw_15m
+            ]
 
         state.last_update = datetime.now(timezone.utc).isoformat()
 
-    def process(self, symbol, state):
+    def process(self, state):
         if not state.active or len(state.candles_1m) < 2:
             return
         state.cycle_count += 1
@@ -290,16 +326,16 @@ class PaperBot:
             ex = check_exit(state, candle)
             if ex:
                 ep, reason = ex
-                self._close(symbol, state, ep, reason)
+                self._close(state, ep, reason)
 
         # Entry check
         if not state.position:
             entry = check_entry(state)
             if entry:
                 d, ep, stop, target = entry
-                self._open(symbol, state, d, ep, stop, target)
+                self._open(state, d, ep, stop, target)
 
-    def _open(self, symbol, state, direction, entry, stop, target):
+    def _open(self, state, direction, entry, stop, target):
         notional = state.capital * state.leverage * 0.5
         state.position = {
             'direction': direction,
@@ -309,9 +345,9 @@ class PaperBot:
             'notional': notional,
             'bars_held': 0,
         }
-        log.info(f"[{symbol}] OPEN {direction.upper()} @ {entry:.6f} | Stop={stop:.6f} Target={target:.6f}")
+        log.info(f"[{state.symbol}] OPEN {direction.upper()} @ {entry:.6f} | Stop={stop:.6f} Target={target:.6f}")
 
-    def _close(self, symbol, state, exit_price, reason):
+    def _close(self, state, exit_price, reason):
         pos = state.position
         if pos['direction'] == 'long':
             pnl_pct = (exit_price - pos['entry']) / pos['entry']
@@ -331,12 +367,12 @@ class PaperBot:
             'x': round(exit_price, 6), 'pnl': round(pnl_net, 4),
             'r': reason, 'bars': pos['bars_held'],
         })
-        log.info(f"[{symbol}] CLOSE {pos['direction'].upper()} @ {exit_price:.6f} | PnL={pnl_net:+.4f} INR | Cap={state.capital:.2f} | {reason}")
+        log.info(f"[{state.symbol}] CLOSE {pos['direction'].upper()} @ {exit_price:.6f} | PnL={pnl_net:+.4f} INR | Cap={state.capital:.2f} | {reason}")
         state.position = None
 
     def run(self):
         log.info("=" * 60)
-        log.info("PAPER FORWARD BOT STARTING")
+        log.info("PAPER FORWARD BOT STARTING (Delta Exchange API)")
         log.info("=" * 60)
         self.setup()
         self.running = True
@@ -344,21 +380,21 @@ class PaperBot:
 
         while self.running:
             cycle += 1
-            for symbol, state in self.states.items():
+            for pid, state in self.states.items():
                 if not state.active:
                     continue
                 try:
-                    self.fetch_candles(symbol, state)
-                    self.process(symbol, state)
+                    self.fetch_candles(state)
+                    self.process(state)
                 except Exception as e:
-                    err = f"[{symbol}] Error: {e}"
+                    err = f"[{state.symbol}] Error: {e}"
                     log.error(err)
                     state.errors.append(err)
 
             if cycle % 20 == 0:
-                for sym, s in self.states.items():
+                for pid, s in self.states.items():
                     wr = s.win_count / max(1, len(s.trades)) * 100
-                    log.info(f"[{sym}] Price={s.last_price:.4f} Cap={s.capital:.2f} PnL={s.total_pnl:+.4f} Trades={len(s.trades)} WR={wr:.0f}%")
+                    log.info(f"[{s.symbol}] Price={s.last_price:.4f} Cap={s.capital:.2f} PnL={s.total_pnl:+.4f} Trades={len(s.trades)} WR={wr:.0f}%")
 
             time.sleep(FETCH_INTERVAL)
 
@@ -378,21 +414,39 @@ def create_app():
         return jsonify({
             'status': 'running',
             'bot': 'Delta Paper Forward Test',
+            'api': 'Delta Exchange India (public)',
+            'strategy': 'VWAP Pullback Scalper',
+            'config': {
+                'target': f'{TARGET_PCT*100:.2f}%',
+                'stop': f'{STOP_PCT*100:.2f}%',
+                'leverage': '50x',
+                'fees': f'{FEE_PER_SIDE*100:.2f}%/side',
+                'capital_per_asset': '100 INR',
+            },
             'uptime_since': bot.start_time,
-            'assets': {s: st.to_dict() for s, st in bot.states.items()},
+            'assets': {str(s): st.to_dict() for s, st in bot.states.items()},
         })
 
     @app.route('/status')
     def status():
+        total_pnl = sum(s.total_pnl for s in bot.states.values())
+        total_trades = sum(len(s.trades) for s in bot.states.values())
+        total_wins = sum(s.win_count for s in bot.states.values())
         return jsonify({
             'status': 'ok',
             'uptime': bot.start_time,
-            'assets': {s: st.to_dict() for s, st in bot.states.items()},
+            'summary': {
+                'total_pnl': round(total_pnl, 4),
+                'total_trades': total_trades,
+                'total_wins': total_wins,
+                'overall_win_rate': round(total_wins / max(1, total_trades) * 100, 1),
+            },
+            'assets': {str(s): st.to_dict() for s, st in bot.states.items()},
         })
 
     @app.route('/trades')
     def trades():
-        return jsonify({s: st.trades[-20:] for s, st in bot.states.items()})
+        return jsonify({str(s): st.trades[-20:] for s, st in bot.states.items()})
 
     @app.route('/health')
     def health():
