@@ -23,12 +23,15 @@ import requests
 API_BASE = 'https://api.india.delta.exchange'
 
 ASSETS = {
-    131253: {'symbol': 'XAUTUSD', 'name': 'Gold (XAUT)',  'capital_inr': 100, 'leverage': 50, 'tick': 0.01},
-    124058: {'symbol': 'SLVONUSD', 'name': 'Silver (SLV)','capital_inr': 100, 'leverage': 50, 'tick': 0.001},
-    14745:  {'symbol': 'DOGEUSD', 'name': 'DOGE',         'capital_inr': 100, 'leverage': 50, 'tick': 0.00001},
+    131253: {'symbol': 'XAUTUSD', 'name': 'Gold (XAUT)',  'capital_inr': 100, 'leverage': 50, 'tick': 0.01,
+             'target_pct': 0.0020, 'stop_pct': 0.0015},   # 0.20% target, 0.15% stop
+    124058: {'symbol': 'SLVONUSD', 'name': 'Silver (SLV)','capital_inr': 100, 'leverage': 50, 'tick': 0.001,
+             'target_pct': 0.0035, 'stop_pct': 0.0025},   # 0.35% target, 0.25% stop (wider for volatility)
+    14745:  {'symbol': 'DOGEUSD', 'name': 'DOGE',         'capital_inr': 100, 'leverage': 50, 'tick': 0.00001,
+             'target_pct': 0.0020, 'stop_pct': 0.0015},   # 0.20% target, 0.15% stop
 }
 
-# Strategy params (validated best config)
+# Strategy params (default - overridden per-asset above)
 TARGET_PCT = 0.0020   # 0.20%
 STOP_PCT = 0.0015     # 0.15%
 FEE_PER_SIDE = 0.0001  # 0.01%
@@ -131,13 +134,15 @@ def rsi_np(arr, n=14):
 
 # === ASSET STATE ===
 class AssetState:
-    def __init__(self, product_id, symbol, name, capital, leverage):
+    def __init__(self, product_id, symbol, name, capital, leverage, target_pct=0.0020, stop_pct=0.0015):
         self.product_id = product_id
         self.symbol = symbol
         self.name = name
         self.capital = capital
         self.initial_capital = capital
         self.leverage = leverage
+        self.target_pct = target_pct
+        self.stop_pct = stop_pct
         self.position = None
         self.trades = []
         self.win_count = 0
@@ -158,6 +163,8 @@ class AssetState:
             'capital': round(self.capital, 2),
             'initial_capital': self.initial_capital,
             'leverage': self.leverage,
+            'target_pct': f'{self.target_pct*100:.2f}%',
+            'stop_pct': f'{self.stop_pct*100:.2f}%',
             'position': {k: round(v, 6) if isinstance(v, float) else v
                          for k, v in self.position.items()} if self.position else None,
             'total_pnl': round(self.total_pnl, 4),
@@ -225,18 +232,22 @@ def check_entry(state):
 
     vwap_dist = abs(price - vwap_val) / price
 
+    # Per-asset stop/target
+    target_pct = getattr(state, 'target_pct', TARGET_PCT)
+    stop_pct = getattr(state, 'stop_pct', STOP_PCT)
+
     # LONG
     if (trend_up and vwap_dist < 0.0005 and
         40 < rsi_val < 55 and price > o and price > vwap_val * 0.999):
-        sd = max(atr_val * 2, price * STOP_PCT * 0.5)
-        sd = min(sd, price * STOP_PCT)
+        sd = max(atr_val * 2, price * stop_pct * 0.5)
+        sd = min(sd, price * stop_pct)
         return ('long', price, price - sd, price + sd * 1.5)
 
     # SHORT
     if (not trend_up and vwap_dist < 0.0005 and
         45 < rsi_val < 60 and price < o and price < vwap_val * 1.001):
-        sd = max(atr_val * 2, price * STOP_PCT * 0.5)
-        sd = min(sd, price * STOP_PCT)
+        sd = max(atr_val * 2, price * stop_pct * 0.5)
+        sd = min(sd, price * stop_pct)
         return ('short', price, price + sd, price - sd * 1.5)
 
     return None
@@ -286,9 +297,13 @@ class PaperBot:
 
     def setup(self):
         for pid, cfg in ASSETS.items():
-            state = AssetState(pid, cfg['symbol'], cfg['name'], cfg['capital_inr'], cfg['leverage'])
+            state = AssetState(pid, cfg['symbol'], cfg['name'], cfg['capital_inr'], cfg['leverage'],
+                               target_pct=cfg.get('target_pct', TARGET_PCT),
+                               stop_pct=cfg.get('stop_pct', STOP_PCT))
             self.states[pid] = state
-            log.info(f"  {cfg['symbol']} (id={pid}): capital={cfg['capital_inr']} INR, leverage={cfg['leverage']}x")
+            tp = cfg.get('target_pct', TARGET_PCT) * 100
+            sp = cfg.get('stop_pct', STOP_PCT) * 100
+            log.info(f"  {cfg['symbol']} (id={pid}): capital={cfg['capital_inr']} INR, leverage={cfg['leverage']}x, target={tp:.2f}%, stop={sp:.2f}%")
         return True
 
     def fetch_candles(self, state):
@@ -422,8 +437,8 @@ def create_app():
             'api': 'Delta Exchange India (public)',
             'strategy': 'VWAP Pullback Scalper',
             'config': {
-                'target': f'{TARGET_PCT*100:.2f}%',
-                'stop': f'{STOP_PCT*100:.2f}%',
+                'target': 'per-asset (see assets)',
+                'stop': 'per-asset (see assets)',
                 'leverage': '50x',
                 'fees': f'{FEE_PER_SIDE*100:.2f}%/side',
                 'capital_per_asset': '100 INR',
