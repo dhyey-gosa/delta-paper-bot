@@ -458,12 +458,11 @@ def create_app():
 # === MAIN ===
 app = create_app()
 
-# Start bot thread at module level (for gunicorn)
-_bot_thread = threading.Thread(target=bot.run, daemon=True)
-_bot_thread.start()
-log.info("Bot thread started at module level")
-
+# Bot thread is started by gunicorn_conf.py post_fork hook
+# For direct __main__ execution, start here:
 if __name__ == '__main__':
+    t = threading.Thread(target=bot.run, daemon=True)
+    t.start()
     port = int(os.environ.get('PORT', 8080))
     log.info(f"Flask on port {port}")
     app.run(host='0.0.0.0', port=port, debug=False)
