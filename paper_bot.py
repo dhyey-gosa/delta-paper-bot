@@ -465,12 +465,13 @@ def create_app():
 # === MAIN ===
 app = create_app()
 
-# Start bot thread at module level (runs in gunicorn gthread worker)
+# Start bot thread
 _bot_thread = threading.Thread(target=bot.run, daemon=True)
 _bot_thread.start()
 log.info("Bot thread started")
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
-    log.info(f"Flask on port {port}")
-    app.run(host='0.0.0.0', port=port, debug=False)
+    log.info(f"Starting waitress on port {port}")
+    from waitress import serve
+    serve(app, host='0.0.0.0', port=port, threads=4)
