@@ -253,29 +253,44 @@ def check_entry(state, of_signal=None):
         sweep_low = of_signal.get('sweep_low', False)
         sweep_high = of_signal.get('sweep_high', False)
         spread_pct = of_signal.get('spread_pct', 0)
+        strength = of_signal.get('aggression_strength', 0)
 
         # Skip if spread too wide (cost eats profit)
         if spread_pct > 0.30:
             return None
 
-        # LONG: buy aggression + bullish orderbook + sweep of lows
-        if trend_up and aggression == 'buy':
-            strength = of_signal.get('aggression_strength', 0)
-            # Strong buy aggression + OB supportive + swept lows = high prob long
-            ob_bull = ob_imb > ORDERBOOK_IMBALANCE
-            if strength >= 0.70 and (ob_bull or sweep_low):
-                sl = h15_low - buf  # below 15m low
+        ob_bull = ob_imb > ORDERBOOK_IMBALANCE
+        ob_bear = ob_imb < (1 - ORDERBOOK_IMBALANCE)
+
+        # LONG: buy aggression
+        if aggression == 'buy':
+            # Primary: trend-aligned + strong
+            if trend_up and strength >= 0.70 and (ob_bull or sweep_low):
+                sl = h15_low - buf
+                risk = price - sl
+                risk_pct = risk / price
+                if MIN_STOP_PCT <= risk_pct <= MAX_STOP_PCT:
+                    return ('long', price, sl, price + risk * RR_MULT)
+            # Counter-trend: very strong aggression + OB support (reversal trade)
+            if not trend_up and strength >= 0.90 and ob_bull:
+                sl = h15_low - buf
                 risk = price - sl
                 risk_pct = risk / price
                 if MIN_STOP_PCT <= risk_pct <= MAX_STOP_PCT:
                     return ('long', price, sl, price + risk * RR_MULT)
 
-        # SHORT: sell aggression + bearish orderbook + sweep of highs
-        if not trend_up and aggression == 'sell':
-            strength = of_signal.get('aggression_strength', 0)
-            ob_bear = ob_imb < (1 - ORDERBOOK_IMBALANCE)
-            if strength >= 0.70 and (ob_bear or sweep_high):
-                sl = h15_high + buf  # above 15m high
+        # SHORT: sell aggression
+        if aggression == 'sell':
+            # Primary: trend-aligned + strong
+            if not trend_up and strength >= 0.70 and (ob_bear or sweep_high):
+                sl = h15_high + buf
+                risk = sl - price
+                risk_pct = risk / price
+                if MIN_STOP_PCT <= risk_pct <= MAX_STOP_PCT:
+                    return ('short', price, sl, price - risk * RR_MULT)
+            # Counter-trend: very strong aggression + OB support (reversal trade)
+            if trend_up and strength >= 0.90 and ob_bear:
+                sl = h15_high + buf
                 risk = sl - price
                 risk_pct = risk / price
                 if MIN_STOP_PCT <= risk_pct <= MAX_STOP_PCT:
@@ -283,7 +298,6 @@ def check_entry(state, of_signal=None):
 
         # ABSORPTION entries (defending level = reversal)
         if trend_up and absorption == 'buy':
-            # Sellers absorbed, buyers defending = long
             sl = h15_low - buf
             risk = price - sl
             risk_pct = risk / price
@@ -291,7 +305,6 @@ def check_entry(state, of_signal=None):
                 return ('long', price, sl, price + risk * RR_MULT)
 
         if not trend_up and absorption == 'sell':
-            # Buyers absorbed, sellers defending = short
             sl = h15_high + buf
             risk = sl - price
             risk_pct = risk / price
