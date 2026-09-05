@@ -181,7 +181,6 @@ class DeltaOrderflow:
 
     def _process_l2_snapshot(self, data):
         """Process full orderbook snapshot (ob_l2) — replaces entire book."""
-        # Format: {"type":"ob_l2","sy":"SYMBOL","buy":[[p,q],...],"sell":[[p,q],...]}
         symbol = data.get('sy', data.get('symbol', '')).upper()
         if symbol not in self.orderbook:
             return
@@ -199,12 +198,6 @@ class DeltaOrderflow:
             parsed.sort(key=lambda x: x[0])
             ob['asks'] = parsed
         ob['ts'] = time.time()
-
-        if self._debug_count < 30:
-            best_bid = ob['bids'][0][0] if ob['bids'] else 0
-            best_ask = ob['asks'][0][0] if ob['asks'] else 999999
-            log.info(f"[Orderflow] SNAPSHOT {symbol} bids={len(ob['bids'])} asks={len(ob['asks'])} best_bid={best_bid} best_ask={best_ask} spread={best_ask-best_bid:.6f}")
-            self._debug_count += 1
 
         self._compute_signals(symbol)
 

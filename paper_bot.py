@@ -44,7 +44,7 @@ SWEEP_LOOKBACK = 20      # liquidity pool = highest high / lowest low of last N 
 SWEEP_MIN_PCT = 0.0003   # wick must exceed pool by >= 0.03% to count as a sweep
 DISP_MIN_PCT = 0.0005    # displacement body >= 0.05%
 DISP_VOL_MULT = 1.1      # displacement volume > 1.1x SMA20
-MIN_STOP_PCT = 0.0025    # skip trade if structure stop < 0.25% (inside noise)
+MIN_STOP_PCT = 0.0005    # skip trade if structure stop < 0.05% (too tight even for gold)
 MAX_STOP_PCT = 0.008     # skip trade if structure stop > 0.80% (too much risk)
 RR_MULT = 2.0            # target = 2R
 KILLZONE_START = 6       # UTC hour: trade only 06:00-20:00 (London/NY gold hours)
@@ -233,12 +233,17 @@ def check_entry(state, of_signal=None):
 
     o, h, l, price, vol = opens[-1], highs[-1], lows[-1], closes_1m[-1], vols[-1]
 
-    # 1min ATR for SL buffer
-    trigs = np.maximum(highs[1:] - lows[1:],
-                       np.maximum(np.abs(highs[1:] - closes_1m[:-1]),
-                                  np.abs(lows[1:] - closes_1m[:-1])))
-    atr_val = trigs[-14:].mean() if len(trigs) >= 14 else trigs.mean()
-    buf = atr_val * 0.25
+    # 15min structure for SL (wider, more reliable stops for gold/silver)
+    h15 = c15m[:, 1]
+    l15 = c15m[:, 2]
+    h15_high = h15[-1]   # current 15m candle high
+    h15_low = l15[-1]    # current 15m candle low
+    # ATR from 15m for buffer
+    trigs15 = np.maximum(h15[1:] - l15[1:],
+                         np.maximum(np.abs(h15[1:] - closes_15m[:-1]),
+                                    np.abs(l15[1:] - closes_15m[:-1])))
+    atr15 = trigs15[-14:].mean() if len(trigs15) >= 14 else trigs15.mean()
+    buf = atr15 * 0.30  # 30% of 15m ATR
 
     # --- ORDERFLOW ENTRY (primary signal) ---
     if of_signal and of_signal.get('ts', 0) > 0:
@@ -259,7 +264,7 @@ def check_entry(state, of_signal=None):
             # Strong buy aggression + OB supportive + swept lows = high prob long
             ob_bull = ob_imb > ORDERBOOK_IMBALANCE
             if strength >= 0.70 and (ob_bull or sweep_low):
-                sl = l - buf
+                sl = h15_low - buf  # below 15m low
                 risk = price - sl
                 risk_pct = risk / price
                 if MIN_STOP_PCT <= risk_pct <= MAX_STOP_PCT:
@@ -270,7 +275,7 @@ def check_entry(state, of_signal=None):
             strength = of_signal.get('aggression_strength', 0)
             ob_bear = ob_imb < (1 - ORDERBOOK_IMBALANCE)
             if strength >= 0.70 and (ob_bear or sweep_high):
-                sl = h + buf
+                sl = h15_high + buf  # above 15m high
                 risk = sl - price
                 risk_pct = risk / price
                 if MIN_STOP_PCT <= risk_pct <= MAX_STOP_PCT:
@@ -279,7 +284,7 @@ def check_entry(state, of_signal=None):
         # ABSORPTION entries (defending level = reversal)
         if trend_up and absorption == 'buy':
             # Sellers absorbed, buyers defending = long
-            sl = l - buf
+            sl = h15_low - buf
             risk = price - sl
             risk_pct = risk / price
             if MIN_STOP_PCT <= risk_pct <= MAX_STOP_PCT:
@@ -287,7 +292,7 @@ def check_entry(state, of_signal=None):
 
         if not trend_up and absorption == 'sell':
             # Buyers absorbed, sellers defending = short
-            sl = h + buf
+            sl = h15_high + buf
             risk = sl - price
             risk_pct = risk / price
             if MIN_STOP_PCT <= risk_pct <= MAX_STOP_PCT:
