@@ -44,7 +44,7 @@ SWEEP_LOOKBACK = 20      # liquidity pool = highest high / lowest low of last N 
 SWEEP_MIN_PCT = 0.0003   # wick must exceed pool by >= 0.03% to count as a sweep
 DISP_MIN_PCT = 0.0005    # displacement body >= 0.05%
 DISP_VOL_MULT = 1.1      # displacement volume > 1.1x SMA20
-MIN_STOP_PCT = 0.0005    # skip trade if structure stop < 0.05% (too tight even for gold)
+MIN_STOP_PCT = 0.0002    # skip trade if structure stop < 0.02% (still meaningful at 50x: 1% risk)
 MAX_STOP_PCT = 0.008     # skip trade if structure stop > 0.80% (too much risk)
 RR_MULT = 2.0            # target = 2R
 KILLZONE_START = 6       # UTC hour: trade only 06:00-20:00 (London/NY gold hours)
@@ -288,6 +288,8 @@ def check_entry(state, of_signal=None):
                 risk_pct = risk / price
                 if MIN_STOP_PCT <= risk_pct <= MAX_STOP_PCT:
                     return ('short', price, sl, price - risk * RR_MULT)
+                elif state and state.cycle_count % 10 == 0:
+                    log.info(f"  SHORT REJECTED: risk_pct={risk_pct:.6f} (need {MIN_STOP_PCT}-{MAX_STOP_PCT}) sl={sl:.4f} price={price:.4f} buf={buf:.4f}")
             # Counter-trend: very strong aggression + OB support (reversal trade)
             if trend_up and strength >= 0.90 and ob_bear:
                 sl = h15_high + buf
@@ -295,6 +297,8 @@ def check_entry(state, of_signal=None):
                 risk_pct = risk / price
                 if MIN_STOP_PCT <= risk_pct <= MAX_STOP_PCT:
                     return ('short', price, sl, price - risk * RR_MULT)
+                elif state and state.cycle_count % 10 == 0:
+                    log.info(f"  SHORT CT REJECTED: risk_pct={risk_pct:.6f} (need {MIN_STOP_PCT}-{MAX_STOP_PCT}) sl={sl:.4f} price={price:.4f} buf={buf:.4f}")
 
         # ABSORPTION entries (defending level = reversal)
         if trend_up and absorption == 'buy':
@@ -456,6 +460,14 @@ class PaperBot:
             if entry:
                 d, ep, stop, target = entry
                 self._open(state, d, ep, stop, target)
+            elif of_sig and of_sig.get('aggression') and state.cycle_count % 5 == 0:
+                # Debug: log why orderflow signal didn't trigger
+                hr = datetime.now(timezone.utc).hour
+                in_zone = KILLZONE_START <= hr < KILLZONE_END
+                log.info(f"[{state.symbol}] SIG={of_sig.get('aggression')}({of_sig.get('aggression_strength',0):.2f}) "
+                         f"OB={of_sig.get('ob_imbalance',0.5):.3f} "
+                         f"SWEEP_L={of_sig.get('sweep_low',False)} SWEEP_H={of_sig.get('sweep_high',False)} "
+                         f"KZ={in_zone} candles1m={len(state.candles_1m)} candles15m={len(state.candles_15m)}")
 
     def _open(self, state, direction, entry, stop, target):
         notional = state.capital * state.leverage * 0.5
