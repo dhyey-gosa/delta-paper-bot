@@ -82,8 +82,8 @@ class DeltaOrderflow:
 
         if msg_type in ('trades', 'all_trades', 'all_trades_snapshot'):
             self._process_trades(data)
-        elif msg_type in ('ob_updates', 'l2_updates'):
-            self._process_l2(data)
+        elif msg_type == 'ob_updates':
+            self._process_ob_update(data)
         elif msg_type in ('ob_l2', 'l2_orderbook'):
             self._process_l2_snapshot(data)
         elif msg_type in ('subscribed', 'unsubscribed'):
@@ -142,49 +142,71 @@ class DeltaOrderflow:
         for symbol in symbols_hit:
             self._compute_signals(symbol)
 
-    def _process_l2(self, data):
-        # Delta ob_updates format: {"a":[[price,qty],...], "b":[[price,qty],...], "sy":"SYMBOL", "type":"ob_updates"}
+    def _process_ob_update(self, data):
+        """Process incremental orderbook update (merge, don't replace)."""
         symbol = data.get('sy', data.get('symbol', '')).upper()
         if symbol not in self.orderbook:
             return
 
-        # 'b' = bids, 'a' = asks
+        ob = self.orderbook[symbol]
+
+        # Merge bid updates
+        bid_updates = data.get('b', [])
+        if bid_updates:
+            existing = {p: q for p, q in ob['bids']}
+            for price_str, qty_str in bid_updates:
+                price = float(price_str)
+                qty = float(qty_str)
+                if qty == 0:
+                    existing.pop(price, None)  # remove level
+                else:
+                    existing[price] = qty
+            ob['bids'] = sorted([(p, q) for p, q in existing.items()], key=lambda x: x[0], reverse=True)
+
+        # Merge ask updates
+        ask_updates = data.get('a', [])
+        if ask_updates:
+            existing = {p: q for p, q in ob['asks']}
+            for price_str, qty_str in ask_updates:
+                price = float(price_str)
+                qty = float(qty_str)
+                if qty == 0:
+                    existing.pop(price, None)
+                else:
+                    existing[price] = qty
+            ob['asks'] = sorted([(p, q) for p, q in existing.items()], key=lambda x: x[0])
+
+        ob['ts'] = time.time()
+        self._compute_signals(symbol)
+
+    def _process_l2_snapshot(self, data):
+        """Process full orderbook snapshot (ob_l2) — replaces entire book."""
+        # Format: {"type":"ob_l2","sy":"SYMBOL","buy":[[p,q],...],"sell":[[p,q],...]}
+        symbol = data.get('sy', data.get('symbol', '')).upper()
+        if symbol not in self.orderbook:
+            return
+
+        ob = self.orderbook[symbol]
         bids = data.get('b', data.get('buy', []))
         asks = data.get('a', data.get('sell', []))
 
         if bids:
-            # Delta sends bids ascending (worst to best) — we need best bid first (descending)
             parsed = [(float(p), float(q)) for p, q in bids]
             parsed.sort(key=lambda x: x[0], reverse=True)
-            self.orderbook[symbol]['bids'] = parsed
+            ob['bids'] = parsed
         if asks:
-            # Delta sends asks ascending (best to worst) — keep as is
             parsed = [(float(p), float(q)) for p, q in asks]
             parsed.sort(key=lambda x: x[0])
-            self.orderbook[symbol]['asks'] = parsed
-        self.orderbook[symbol]['ts'] = time.time()
+            ob['asks'] = parsed
+        ob['ts'] = time.time()
+
+        if self._debug_count < 30:
+            best_bid = ob['bids'][0][0] if ob['bids'] else 0
+            best_ask = ob['asks'][0][0] if ob['asks'] else 999999
+            log.info(f"[Orderflow] SNAPSHOT {symbol} bids={len(ob['bids'])} asks={len(ob['asks'])} best_bid={best_bid} best_ask={best_ask} spread={best_ask-best_bid:.6f}")
+            self._debug_count += 1
 
         self._compute_signals(symbol)
-
-    def _process_l2_snapshot(self, data):
-        results = data.get('result', [])
-        if not isinstance(results, list):
-            return
-        for entry in results:
-            symbol = entry.get('symbol', entry.get('sy', '')).upper()
-            if symbol not in self.orderbook:
-                continue
-            bids = entry.get('b', entry.get('buy', []))
-            asks = entry.get('a', entry.get('sell', []))
-            if bids:
-                parsed = [(float(p), float(q)) for p, q in bids]
-                parsed.sort(key=lambda x: x[0], reverse=True)
-                self.orderbook[symbol]['bids'] = parsed
-            if asks:
-                parsed = [(float(p), float(q)) for p, q in asks]
-                parsed.sort(key=lambda x: x[0])
-                self.orderbook[symbol]['asks'] = parsed
-            self.orderbook[symbol]['ts'] = time.time()
 
     def _compute_signals(self, symbol):
         """Compute all orderflow signals for a symbol."""
@@ -329,20 +351,20 @@ class DeltaOrderflow:
         self.connected = True
         log.info(f"[Orderflow] Connected. Subscribing to {self.symbols}...")
 
-        # Delta public WebSocket: correct channel names from docs
-        # https://docs.delta.exchange -> "trades", "ob_updates", "ob_l2"
-        # Max 4 symbols per subscription for orderbook channels
+        # Delta public WebSocket: subscribe to trades, full snapshot (ob_l2), and incremental (ob_updates)
+        # ob_l2 = full orderbook snapshot; ob_updates = incremental changes
         sub = {
             "type": "subscribe",
             "payload": {
                 "channels": [
                     {"name": "trades", "symbols": self.symbols},
+                    {"name": "ob_l2", "symbols": self.symbols[:4]},
                     {"name": "ob_updates", "symbols": self.symbols[:4]},
                 ]
             }
         }
         ws.send(json.dumps(sub))
-        log.info(f"[Orderflow] Sent subscribe: {json.dumps(sub)}")
+        log.info(f"[Orderflow] Sent subscribe: trades + ob_l2 + ob_updates for {self.symbols}")
 
     def start(self):
         """Start WebSocket in background thread."""
