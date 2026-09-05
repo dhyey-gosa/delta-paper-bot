@@ -273,7 +273,9 @@ def check_entry(state, of_signal=None):
                     return ('long', price, sl, price + risk * RR_MULT)
             # Counter-trend: very strong aggression + OB support (reversal trade)
             if not trend_up and strength >= 0.90 and ob_bull:
-                sl = h15_low - buf
+                # Tighter stop for counter-trend: 1.5x 15m ATR from entry
+                ct_buf = atr15 * 1.5
+                sl = price - ct_buf
                 risk = price - sl
                 risk_pct = risk / price
                 if MIN_STOP_PCT <= risk_pct <= MAX_STOP_PCT:
@@ -292,7 +294,9 @@ def check_entry(state, of_signal=None):
                     log.info(f"  SHORT REJECTED: risk_pct={risk_pct:.6f} (need {MIN_STOP_PCT}-{MAX_STOP_PCT}) sl={sl:.4f} price={price:.4f} buf={buf:.4f}")
             # Counter-trend: very strong aggression + OB support (reversal trade)
             if trend_up and strength >= 0.90 and ob_bear:
-                sl = h15_high + buf
+                # Tighter stop for counter-trend: 1.5x 15m ATR from entry
+                ct_buf = atr15 * 1.5
+                sl = price + ct_buf
                 risk = sl - price
                 risk_pct = risk / price
                 if MIN_STOP_PCT <= risk_pct <= MAX_STOP_PCT:
