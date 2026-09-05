@@ -33,7 +33,7 @@ TRADE_HISTORY_SEC = 300  # keep 5 min of trades
 CVD_SPIKE_PCT = 0.70      # CVD ratio > 0.70 in any window = aggression
 ABSORPTION_VOL_MULT = 3.0  # trade volume > 3x avg = large trade
 ABSORPTION_PRICE_MOVE = 0.0005  # price moved < 0.05% after large trades = absorption
-ORDERBOOK_IMBALANCE = 0.65  # 65%+ one-sided depth = imbalance
+ORDERBOOK_IMBALANCE = 0.55  # 55%+ one-sided depth = imbalance (relaxed from 0.65)
 SWEEP_DEPTH_PCT = 0.002     # orderbook sweep: price pierces 0.2% into opposite side
 
 
