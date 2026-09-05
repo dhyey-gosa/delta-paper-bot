@@ -71,7 +71,14 @@ class DeltaOrderflow:
 
         msg_type = data.get('type', '')
 
-        if msg_type == 'all_trades':
+        # Debug: log every message type we receive (first 5 of each)
+        if not hasattr(self, '_msg_counts'):
+            self._msg_counts = {}
+        self._msg_counts[msg_type] = self._msg_counts.get(msg_type, 0) + 1
+        if self._msg_counts[msg_type] <= 5:
+            log.info(f"[Orderflow] MSG type={msg_type} keys={list(data.keys())} sample={str(data)[:300]}")
+
+        if msg_type == 'all_trades' or msg_type == 'all_trades_snapshot':
             self._process_trades(data)
         elif msg_type == 'l2_updates':
             self._process_l2(data)
@@ -290,29 +297,19 @@ class DeltaOrderflow:
         self.connected = True
         log.info(f"[Orderflow] Connected. Subscribing to {self.symbols}...")
 
-        # Subscribe to all_trades
-        sub_trades = {
+        # Delta public WebSocket subscribe - try multiple formats
+        # Format A: single message, multiple channels
+        sub_a = {
             "type": "subscribe",
             "payload": {
-                "channels": [{
-                    "name": "all_trades",
-                    "symbols": self.symbols
-                }]
+                "channels": [
+                    {"name": "all_trades", "symbols": self.symbols},
+                    {"name": "l2_updates", "symbols": self.symbols},
+                ]
             }
         }
-        ws.send(json.dumps(sub_trades))
-
-        # Subscribe to l2_updates (orderbook)
-        sub_l2 = {
-            "type": "subscribe",
-            "payload": {
-                "channels": [{
-                    "name": "l2_updates",
-                    "symbols": self.symbols
-                }]
-            }
-        }
-        ws.send(json.dumps(sub_l2))
+        ws.send(json.dumps(sub_a))
+        log.info(f"[Orderflow] Sent combined subscribe: {json.dumps(sub_a)}")
 
         log.info(f"[Orderflow] Subscribed to all_trades + l2_updates for {self.symbols}")
 
