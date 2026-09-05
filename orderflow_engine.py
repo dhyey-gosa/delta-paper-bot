@@ -6,7 +6,7 @@ Connects to Delta's public WebSocket for real-time:
 
 Data sources:
 - wss://public-socket.india.delta.exchange (public, no auth)
-- Channels: all_trades, l2_updates
+- Channels: trades, ob_updates
 
 No API key needed. Free public data.
 """
@@ -63,6 +63,10 @@ class DeltaOrderflow:
         # Last price from trade stream
         self.last_price = {s: 0.0 for s in self.symbols}
 
+        # Debug counter
+        self._debug_count = 0
+        self._msg_counts = {}
+
     def _on_message(self, ws, message):
         try:
             data = json.loads(message)
@@ -72,17 +76,15 @@ class DeltaOrderflow:
         msg_type = data.get('type', '')
 
         # Debug: log every message type we receive (first 5 of each)
-        if not hasattr(self, '_msg_counts'):
-            self._msg_counts = {}
         self._msg_counts[msg_type] = self._msg_counts.get(msg_type, 0) + 1
         if self._msg_counts[msg_type] <= 5:
             log.info(f"[Orderflow] MSG type={msg_type} keys={list(data.keys())} sample={str(data)[:300]}")
 
-        if msg_type == 'all_trades' or msg_type == 'all_trades_snapshot':
+        if msg_type in ('trades', 'all_trades', 'all_trades_snapshot'):
             self._process_trades(data)
-        elif msg_type == 'l2_updates':
+        elif msg_type in ('ob_updates', 'l2_updates'):
             self._process_l2(data)
-        elif msg_type == 'l2_orderbook':
+        elif msg_type in ('ob_l2', 'l2_orderbook'):
             self._process_l2_snapshot(data)
         elif msg_type in ('subscribed', 'unsubscribed'):
             log.info(f"WS event: {msg_type}")
@@ -90,7 +92,15 @@ class DeltaOrderflow:
             log.error(f"WS error: {data}")
 
     def _process_trades(self, data):
-        results = data.get('result', [])
+        # Delta trades channel may put data in 'result' (list) or 'trades' or directly
+        results = data.get('result', data.get('trades', []))
+        if not isinstance(results, list):
+            results = []
+
+        # Also handle single trade (not wrapped in list)
+        if isinstance(data.get('symbol'), str) and 'price' in data:
+            results = [data]
+
         now = time.time()
 
         for t in results:
@@ -98,23 +108,24 @@ class DeltaOrderflow:
             if symbol not in self.trades:
                 continue
 
-            price = float(t.get('price', 0))
-            qty = float(t.get('size', 0))
-            side = t.get('seller', None)  # True = seller initiated (aggressive sell)
+            price = float(t.get('price', t.get('fill_price', 0)))
+            qty = float(t.get('size', t.get('qty', 0)))
 
-            # Delta API: 'seller' field indicates if seller was maker
-            # Actually 'seller' is not the aggression indicator.
-            # The aggression is: if buyer is taker = aggressive buy, seller taker = aggressive sell
-            # In Delta's all_trades, 'seller' = True means the seller was the maker (resting order),
-            # so the BUYER was the taker (aggressive buy).
-            # 'seller' = False means buyer was maker, seller was taker (aggressive sell).
-            if side is True or side == 'True':
-                aggression = 'buy'   # buyer was taker
+            # Delta 'seller' field: True = seller was maker (buyer was taker = aggressive buy)
+            # 'side' field from trades channel: 'buy' or 'sell' = taker side
+            if 'side' in t:
+                aggression = t['side'].lower()
+            elif 'seller' in t:
+                aggression = 'buy' if t.get('seller') in (True, 'True', 'true') else 'sell'
             else:
-                aggression = 'sell'  # seller was taker
+                aggression = 'buy'  # fallback
 
             self.trades[symbol].append((now, price, qty, aggression))
             self.last_price[symbol] = price
+
+            if self._debug_count < 10:
+                log.info(f"[Orderflow] TRADE {symbol} {aggression} {qty}@{price} seller={t.get('seller')} side={t.get('side')}")
+                self._debug_count += 1
 
         # Update signals after batch
         for symbol in self.symbols:
@@ -297,21 +308,20 @@ class DeltaOrderflow:
         self.connected = True
         log.info(f"[Orderflow] Connected. Subscribing to {self.symbols}...")
 
-        # Delta public WebSocket subscribe - try multiple formats
-        # Format A: single message, multiple channels
-        sub_a = {
+        # Delta public WebSocket: correct channel names from docs
+        # https://docs.delta.exchange -> "trades", "ob_updates", "ob_l2"
+        # Max 4 symbols per subscription for orderbook channels
+        sub = {
             "type": "subscribe",
             "payload": {
                 "channels": [
-                    {"name": "all_trades", "symbols": self.symbols},
-                    {"name": "l2_updates", "symbols": self.symbols},
+                    {"name": "trades", "symbols": self.symbols},
+                    {"name": "ob_updates", "symbols": self.symbols[:4]},
                 ]
             }
         }
-        ws.send(json.dumps(sub_a))
-        log.info(f"[Orderflow] Sent combined subscribe: {json.dumps(sub_a)}")
-
-        log.info(f"[Orderflow] Subscribed to all_trades + l2_updates for {self.symbols}")
+        ws.send(json.dumps(sub))
+        log.info(f"[Orderflow] Sent subscribe: {json.dumps(sub)}")
 
     def start(self):
         """Start WebSocket in background thread."""
