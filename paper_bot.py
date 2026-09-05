@@ -250,7 +250,7 @@ def check_entry(state, of_signal=None):
         spread_pct = of_signal.get('spread_pct', 0)
 
         # Skip if spread too wide (cost eats profit)
-        if spread_pct > 0.08:
+        if spread_pct > 0.30:
             return None
 
         # LONG: buy aggression + bullish orderbook + sweep of lows

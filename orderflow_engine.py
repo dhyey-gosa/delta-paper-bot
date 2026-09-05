@@ -153,9 +153,15 @@ class DeltaOrderflow:
         asks = data.get('a', data.get('sell', []))
 
         if bids:
-            self.orderbook[symbol]['bids'] = [(float(p), float(q)) for p, q in bids]
+            # Delta sends bids ascending (worst to best) — we need best bid first (descending)
+            parsed = [(float(p), float(q)) for p, q in bids]
+            parsed.sort(key=lambda x: x[0], reverse=True)
+            self.orderbook[symbol]['bids'] = parsed
         if asks:
-            self.orderbook[symbol]['asks'] = [(float(p), float(q)) for p, q in asks]
+            # Delta sends asks ascending (best to worst) — keep as is
+            parsed = [(float(p), float(q)) for p, q in asks]
+            parsed.sort(key=lambda x: x[0])
+            self.orderbook[symbol]['asks'] = parsed
         self.orderbook[symbol]['ts'] = time.time()
 
         self._compute_signals(symbol)
@@ -165,15 +171,19 @@ class DeltaOrderflow:
         if not isinstance(results, list):
             return
         for entry in results:
-            symbol = entry.get('symbol', '').upper()
+            symbol = entry.get('symbol', entry.get('sy', '')).upper()
             if symbol not in self.orderbook:
                 continue
-            buy = entry.get('buy', [])
-            sell = entry.get('sell', [])
-            if buy:
-                self.orderbook[symbol]['bids'] = [(float(p), float(q)) for p, q in buy]
-            if sell:
-                self.orderbook[symbol]['asks'] = [(float(p), float(q)) for p, q in sell]
+            bids = entry.get('b', entry.get('buy', []))
+            asks = entry.get('a', entry.get('sell', []))
+            if bids:
+                parsed = [(float(p), float(q)) for p, q in bids]
+                parsed.sort(key=lambda x: x[0], reverse=True)
+                self.orderbook[symbol]['bids'] = parsed
+            if asks:
+                parsed = [(float(p), float(q)) for p, q in asks]
+                parsed.sort(key=lambda x: x[0])
+                self.orderbook[symbol]['asks'] = parsed
             self.orderbook[symbol]['ts'] = time.time()
 
     def _compute_signals(self, symbol):
