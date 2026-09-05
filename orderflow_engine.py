@@ -92,59 +92,70 @@ class DeltaOrderflow:
             log.error(f"WS error: {data}")
 
     def _process_trades(self, data):
-        # Delta trades channel may put data in 'result' (list) or 'trades' or directly
+        # Delta trades channel sends individual trades: {"p":"price","r":"m/t","s":qty,"sy":"SYMBOL","type":"trades"}
+        # Also handle batch format: {"result": [...trades...]}
         results = data.get('result', data.get('trades', []))
         if not isinstance(results, list):
             results = []
 
-        # Also handle single trade (not wrapped in list)
-        if isinstance(data.get('symbol'), str) and 'price' in data:
+        # Individual trade (common format on this channel)
+        if data.get('type') == 'trades' and 'sy' in data:
             results = [data]
 
         now = time.time()
 
         for t in results:
-            symbol = t.get('symbol', '').upper()
+            symbol = t.get('sy', t.get('symbol', '')).upper()
             if symbol not in self.trades:
                 continue
 
-            price = float(t.get('price', t.get('fill_price', 0)))
-            qty = float(t.get('size', t.get('qty', 0)))
+            price = float(t.get('p', t.get('price', t.get('fill_price', 0))))
+            qty = float(t.get('s', t.get('size', t.get('qty', 0))))
 
-            # Delta 'seller' field: True = seller was maker (buyer was taker = aggressive buy)
-            # 'side' field from trades channel: 'buy' or 'sell' = taker side
-            if 'side' in t:
+            # Delta 'r' field: "m" = maker was seller (buyer taker = aggressive buy)
+            #                   "t" = taker was seller (seller taker = aggressive sell)
+            role = t.get('r', t.get('side', ''))
+            if role == 'm':
+                aggression = 'buy'   # buyer was taker
+            elif role == 't':
+                aggression = 'sell'  # seller was taker
+            elif 'side' in t:
                 aggression = t['side'].lower()
             elif 'seller' in t:
                 aggression = 'buy' if t.get('seller') in (True, 'True', 'true') else 'sell'
             else:
-                aggression = 'buy'  # fallback
+                aggression = 'buy'
 
             self.trades[symbol].append((now, price, qty, aggression))
             self.last_price[symbol] = price
 
-            if self._debug_count < 10:
-                log.info(f"[Orderflow] TRADE {symbol} {aggression} {qty}@{price} seller={t.get('seller')} side={t.get('side')}")
+            if self._debug_count < 20:
+                log.info(f"[Orderflow] TRADE {symbol} {aggression} {qty}@{price} role={role}")
                 self._debug_count += 1
 
         # Update signals after batch
-        for symbol in self.symbols:
-            if any(t.get('symbol', '').upper() == symbol for t in results):
-                self._compute_signals(symbol)
+        symbols_hit = set()
+        for t in results:
+            s = t.get('sy', t.get('symbol', '')).upper()
+            if s in self.symbols:
+                symbols_hit.add(s)
+        for symbol in symbols_hit:
+            self._compute_signals(symbol)
 
     def _process_l2(self, data):
-        result = data.get('result', {})
-        symbol = result.get('symbol', '').upper()
+        # Delta ob_updates format: {"a":[[price,qty],...], "b":[[price,qty],...], "sy":"SYMBOL", "type":"ob_updates"}
+        symbol = data.get('sy', data.get('symbol', '')).upper()
         if symbol not in self.orderbook:
             return
 
-        buy = result.get('buy', [])
-        sell = result.get('sell', [])
+        # 'b' = bids, 'a' = asks
+        bids = data.get('b', data.get('buy', []))
+        asks = data.get('a', data.get('sell', []))
 
-        if buy:
-            self.orderbook[symbol]['bids'] = [(float(p), float(q)) for p, q in buy]
-        if sell:
-            self.orderbook[symbol]['asks'] = [(float(p), float(q)) for p, q in sell]
+        if bids:
+            self.orderbook[symbol]['bids'] = [(float(p), float(q)) for p, q in bids]
+        if asks:
+            self.orderbook[symbol]['asks'] = [(float(p), float(q)) for p, q in asks]
         self.orderbook[symbol]['ts'] = time.time()
 
         self._compute_signals(symbol)
