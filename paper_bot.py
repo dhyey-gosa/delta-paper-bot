@@ -19,6 +19,8 @@ from collections import deque
 import numpy as np
 import requests
 
+from orderflow_engine import DeltaOrderflow, format_signal, ORDERBOOK_IMBALANCE
+
 # === CONFIG ===
 API_BASE = 'https://api.india.delta.exchange'
 
@@ -195,12 +197,11 @@ class AssetState:
         }
 
 
-# === STRATEGY v2: SMC/ICT-lite (liquidity sweep + displacement, 15m bias, 2R) ===
-# NOTE: true orderflow (DOM/footprint/CVD) is NOT available on Delta's public
-# candles API, so this is the candles-only approximation: wick-sweep of the
-# rolling pool + displacement close + volume expansion, in the direction of
-# the 15m EMA bias. Fewer trades, wider structure stops, 2R targets.
-def check_entry(state):
+# === STRATEGY v3: ORDERFLOW + SMC (Delta WebSocket real-time) ===
+# Primary: orderflow signals (CVD aggression, absorption, orderbook sweep)
+# Filter: 15m EMA bias + candle structure confirmation
+# This uses REAL orderflow data from Delta Exchange's public WebSocket.
+def check_entry(state, of_signal=None):
     if len(state.candles_1m) < 30 or len(state.candles_15m) < 25:
         return None
 
@@ -232,7 +233,68 @@ def check_entry(state):
 
     o, h, l, price, vol = opens[-1], highs[-1], lows[-1], closes_1m[-1], vols[-1]
 
-    # Liquidity pools: prior-bar high/low of last N bars (exclude current bar)
+    # 1min ATR for SL buffer
+    trigs = np.maximum(highs[1:] - lows[1:],
+                       np.maximum(np.abs(highs[1:] - closes_1m[:-1]),
+                                  np.abs(lows[1:] - closes_1m[:-1])))
+    atr_val = trigs[-14:].mean() if len(trigs) >= 14 else trigs.mean()
+    buf = atr_val * 0.25
+
+    # --- ORDERFLOW ENTRY (primary signal) ---
+    if of_signal and of_signal.get('ts', 0) > 0:
+        aggression = of_signal.get('aggression')
+        absorption = of_signal.get('absorption')
+        ob_imb = of_signal.get('ob_imbalance', 0.5)
+        sweep_low = of_signal.get('sweep_low', False)
+        sweep_high = of_signal.get('sweep_high', False)
+        spread_pct = of_signal.get('spread_pct', 0)
+
+        # Skip if spread too wide (cost eats profit)
+        if spread_pct > 0.08:
+            return None
+
+        # LONG: buy aggression + bullish orderbook + sweep of lows
+        if trend_up and aggression == 'buy':
+            strength = of_signal.get('aggression_strength', 0)
+            # Strong buy aggression + OB supportive + swept lows = high prob long
+            ob_bull = ob_imb > ORDERBOOK_IMBALANCE
+            if strength >= 0.70 and (ob_bull or sweep_low):
+                sl = l - buf
+                risk = price - sl
+                risk_pct = risk / price
+                if MIN_STOP_PCT <= risk_pct <= MAX_STOP_PCT:
+                    return ('long', price, sl, price + risk * RR_MULT)
+
+        # SHORT: sell aggression + bearish orderbook + sweep of highs
+        if not trend_up and aggression == 'sell':
+            strength = of_signal.get('aggression_strength', 0)
+            ob_bear = ob_imb < (1 - ORDERBOOK_IMBALANCE)
+            if strength >= 0.70 and (ob_bear or sweep_high):
+                sl = h + buf
+                risk = sl - price
+                risk_pct = risk / price
+                if MIN_STOP_PCT <= risk_pct <= MAX_STOP_PCT:
+                    return ('short', price, sl, price - risk * RR_MULT)
+
+        # ABSORPTION entries (defending level = reversal)
+        if trend_up and absorption == 'buy':
+            # Sellers absorbed, buyers defending = long
+            sl = l - buf
+            risk = price - sl
+            risk_pct = risk / price
+            if MIN_STOP_PCT <= risk_pct <= MAX_STOP_PCT:
+                return ('long', price, sl, price + risk * RR_MULT)
+
+        if not trend_up and absorption == 'sell':
+            # Buyers absorbed, sellers defending = short
+            sl = h + buf
+            risk = sl - price
+            risk_pct = risk / price
+            if MIN_STOP_PCT <= risk_pct <= MAX_STOP_PCT:
+                return ('short', price, sl, price - risk * RR_MULT)
+
+    # --- CANDLE-ONLY FALLBACK (when orderflow unavailable) ---
+    # Liquidity pools: prior-bar high/low of last N bars
     n = min(SWEEP_LOOKBACK, len(c1m) - 1)
     pool_high = highs[-n-1:-1].max()
     pool_low = lows[-n-1:-1].min()
@@ -244,14 +306,6 @@ def check_entry(state):
         return None
     body_pct = abs(price - o) / price
 
-    # 1min ATR for SL buffer
-    trigs = np.maximum(highs[1:] - lows[1:],
-                       np.maximum(np.abs(highs[1:] - closes_1m[:-1]),
-                                  np.abs(lows[1:] - closes_1m[:-1])))
-    atr_val = trigs[-14:].mean() if len(trigs) >= 14 else trigs.mean()
-    buf = atr_val * 0.25
-
-    # LONG: sweep of lows (stop hunt) + bullish displacement close back inside
     if trend_up:
         swept = (l < pool_low) and (price > pool_low)
         depth_ok = (pool_low - l) / pool_low >= SWEEP_MIN_PCT
@@ -262,9 +316,7 @@ def check_entry(state):
             risk_pct = risk / price
             if MIN_STOP_PCT <= risk_pct <= MAX_STOP_PCT:
                 return ('long', price, sl, price + risk * RR_MULT)
-            return None
 
-    # SHORT: sweep of highs + bearish displacement close back inside
     if not trend_up:
         swept = (h > pool_high) and (price < pool_high)
         depth_ok = (h - pool_high) / pool_high >= SWEEP_MIN_PCT
@@ -275,7 +327,6 @@ def check_entry(state):
             risk_pct = risk / price
             if MIN_STOP_PCT <= risk_pct <= MAX_STOP_PCT:
                 return ('short', price, sl, price - risk * RR_MULT)
-            return None
 
     return None
 
@@ -317,6 +368,7 @@ def check_exit(state, current_candle):
 class PaperBot:
     def __init__(self):
         self.api = DeltaPublicAPI()
+        self.orderflow = DeltaOrderflow([cfg['symbol'] for cfg in ASSETS.values()])
         self.states = {}
         self.running = False
         self.start_time = datetime.now(timezone.utc).isoformat()
@@ -370,7 +422,7 @@ class PaperBot:
                 ep, reason = ex
                 self._close(state, ep, reason)
 
-        # Entry check (cooldown + max trades/day)
+        # Entry check (cooldown + max trades/day + orderflow)
         if not state.position:
             if state.cycle_count - state.last_entry_cycle < COOLDOWN_CYCLES:
                 return
@@ -380,7 +432,9 @@ class PaperBot:
                 state.day_count = 0
             if state.day_count >= MAX_TRADES_PER_DAY:
                 return
-            entry = check_entry(state)
+            # Get real-time orderflow signal
+            of_sig = self.orderflow.get_signal(state.symbol)
+            entry = check_entry(state, of_signal=of_sig)
             if entry:
                 d, ep, stop, target = entry
                 self._open(state, d, ep, stop, target)
@@ -424,10 +478,21 @@ class PaperBot:
 
     def run(self):
         log.info("=" * 60)
-        log.info("PAPER FORWARD BOT STARTING (Delta Exchange API)")
+        log.info("PAPER FORWARD BOT v3 - ORDERFLOW (Delta WebSocket)")
         log.info("=" * 60)
         self.running = True
         cycle = 0
+
+        # Start orderflow WebSocket
+        self.orderflow.start()
+        # Wait for connection
+        for _ in range(20):
+            if self.orderflow.is_alive():
+                log.info("[Orderflow] WebSocket connected and streaming")
+                break
+            time.sleep(1)
+        else:
+            log.warning("[Orderflow] WebSocket not connected after 20s, proceeding with candle-only fallback")
 
         while self.running:
             cycle += 1
@@ -472,7 +537,7 @@ def create_app():
             'status': 'running',
             'bot': 'Delta Paper Forward Test',
             'api': 'Delta Exchange India (public)',
-            'strategy': 'SMC Sweep + Displacement v2 (15m bias, 2R, killzone 06-20 UTC)',
+            'strategy': 'ORDERFLOW + SMC v3 (Delta WS real-time CVD + OB imbalance + sweep, 15m bias, 2R)',
             'config': {
                 'target': 'per-asset (see assets)',
                 'stop': 'per-asset (see assets)',
@@ -490,9 +555,26 @@ def create_app():
         total_pnl = sum(s.total_pnl for s in b.states.values())
         total_trades = sum(len(s.trades) for s in b.states.values())
         total_wins = sum(s.win_count for s in b.states.values())
+
+        # Orderflow status
+        of_status = {
+            'connected': b.orderflow.is_alive(),
+            'symbols': {},
+        }
+        for sym in b.orderflow.symbols:
+            sig = b.orderflow.get_signal(sym)
+            of_status['symbols'][sym] = {
+                'signal': format_signal(sig),
+                'cvd_30s': sig.get('cvd_30s', 0.5),
+                'ob_imbalance': sig.get('ob_imbalance', 0.5),
+                'spread_pct': sig.get('spread_pct', 0),
+                'trade_count_60s': b.orderflow.get_trade_count(sym, 60),
+            }
+
         return jsonify({
             'status': 'ok',
             'uptime': b.start_time,
+            'orderflow': of_status,
             'summary': {
                 'total_pnl': round(total_pnl, 4),
                 'total_trades': total_trades,
