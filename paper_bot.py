@@ -59,8 +59,8 @@ MAX_STOP_PCT = 0.008     # skip trade if structure stop > 0.80% (too much risk)
 RR_MULT = 2.0            # target = 2R
 KILLZONE_START = 6       # UTC hour: trade only 06:00-20:00 (London/NY gold hours)
 KILLZONE_END = 20
-MAX_TRADES_PER_DAY = 6
-COOLDOWN_CYCLES = 40     # ~10 min between entries per asset (40 cycles x 15s)
+MAX_TRADES_PER_DAY = 20
+COOLDOWN_CYCLES = 12     # ~3 min between entries per asset (12 cycles x 15s). More shots.
 
 FETCH_INTERVAL = 15  # seconds
 
