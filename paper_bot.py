@@ -4,7 +4,7 @@ Live prices via Delta Exchange public API, paper trading with 100 INR per asset,
 Deployed on Render, kept alive by UptimeRobot.
 
 Assets: XAUTUSD (gold), SLVONUSD (silver), DOGEUSD
-Strategy: VWAP Pullback Scalper on 1min
+Strategy: SMC Sweep + Displacement v2 (15m bias, 2R, killzone 06-20 UTC)
 Product IDs: XAUTUSD=131253, SLVONUSD=124058, DOGEUSD=14745
 """
 import os
@@ -24,11 +24,11 @@ API_BASE = 'https://api.india.delta.exchange'
 
 ASSETS = {
     131253: {'symbol': 'XAUTUSD', 'name': 'Gold (XAUT)',  'capital_inr': 100, 'leverage': 50, 'tick': 0.01,
-             'target_pct': 0.0020, 'stop_pct': 0.0015},   # 0.20% target, 0.15% stop
+             'target_pct': 0.0020, 'stop_pct': 0.0015, 'enabled': True},
     124058: {'symbol': 'SLVONUSD', 'name': 'Silver (SLV)','capital_inr': 100, 'leverage': 50, 'tick': 0.001,
-             'target_pct': 0.0035, 'stop_pct': 0.0025},   # 0.35% target, 0.25% stop (wider for volatility)
+             'target_pct': 0.0035, 'stop_pct': 0.0025, 'enabled': True},
     14745:  {'symbol': 'DOGEUSD', 'name': 'DOGE',         'capital_inr': 100, 'leverage': 50, 'tick': 0.00001,
-             'target_pct': 0.0020, 'stop_pct': 0.0015},   # 0.20% target, 0.15% stop
+             'target_pct': 0.0020, 'stop_pct': 0.0015, 'enabled': False},  # paused: -53 INR, chops in noise
 }
 
 # Strategy params (default - overridden per-asset above)
@@ -36,6 +36,19 @@ TARGET_PCT = 0.0020   # 0.20%
 STOP_PCT = 0.0015     # 0.15%
 FEE_PER_SIDE = 0.0001  # 0.01%
 COOLDOWN_BARS = 0
+
+# === SMC/ICT-lite v2 (sweep + displacement + 2R) ===
+SWEEP_LOOKBACK = 20      # liquidity pool = highest high / lowest low of last N 1m bars
+SWEEP_MIN_PCT = 0.0003   # wick must exceed pool by >= 0.03% to count as a sweep
+DISP_MIN_PCT = 0.0005    # displacement body >= 0.05%
+DISP_VOL_MULT = 1.1      # displacement volume > 1.1x SMA20
+MIN_STOP_PCT = 0.0025    # skip trade if structure stop < 0.25% (inside noise)
+MAX_STOP_PCT = 0.008     # skip trade if structure stop > 0.80% (too much risk)
+RR_MULT = 2.0            # target = 2R
+KILLZONE_START = 6       # UTC hour: trade only 06:00-20:00 (London/NY gold hours)
+KILLZONE_END = 20
+MAX_TRADES_PER_DAY = 6
+COOLDOWN_CYCLES = 40     # ~10 min between entries per asset (40 cycles x 15s)
 
 FETCH_INTERVAL = 15  # seconds
 
@@ -154,6 +167,9 @@ class AssetState:
         self.last_update = None
         self.errors = []
         self.cycle_count = 0
+        self.last_entry_cycle = -9999
+        self.day_key = None
+        self.day_count = 0
 
     def to_dict(self):
         return {
@@ -179,76 +195,87 @@ class AssetState:
         }
 
 
-# === STRATEGY ===
+# === STRATEGY v2: SMC/ICT-lite (liquidity sweep + displacement, 15m bias, 2R) ===
+# NOTE: true orderflow (DOM/footprint/CVD) is NOT available on Delta's public
+# candles API, so this is the candles-only approximation: wick-sweep of the
+# rolling pool + displacement close + volume expansion, in the direction of
+# the 15m EMA bias. Fewer trades, wider structure stops, 2R targets.
 def check_entry(state):
     if len(state.candles_1m) < 30 or len(state.candles_15m) < 25:
         return None
 
+    # Killzone: gold trends London/NY (06-20 UTC). Asia chop = skip.
+    try:
+        hr = datetime.now(timezone.utc).hour
+        if hr < KILLZONE_START or hr >= KILLZONE_END:
+            return None
+    except Exception:
+        pass
+
     c1m = np.array(state.candles_1m, dtype=float)  # [o, h, l, c, v]
     c15m = np.array(state.candles_15m, dtype=float)
 
-    closes_1m = c1m[:, 3]   # close
+    closes_1m = c1m[:, 3]
     closes_15m = c15m[:, 3]
 
-    # 15min trend
+    # 15min bias (HTF)
     e9 = ema_np(closes_15m, 9)
     e21 = ema_np(closes_15m, 21)
     if np.isnan(e9[-1]) or np.isnan(e21[-1]):
         return None
     trend_up = e9[-1] > e21[-1]
 
-    # 1min VWAP
-    typical = (c1m[:, 1] + c1m[:, 2] + c1m[:, 3]) / 3
-    tp_vol = typical * c1m[:, 4]
-    cum_tp_vol = np.cumsum(tp_vol)
-    cum_vol = np.cumsum(c1m[:, 4])
-    with np.errstate(divide='ignore', invalid='ignore'):
-        vwap = np.where(cum_vol > 0, cum_tp_vol / cum_vol, np.nan)
-    vwap_val = vwap[-1]
-    if np.isnan(vwap_val):
-        return None
-
-    # 1min RSI
-    rsi_vals = rsi_np(closes_1m, 14)
-    rsi_val = rsi_vals[-1]
-
-    # 1min ATR
+    opens = c1m[:, 0]
     highs = c1m[:, 1]
     lows = c1m[:, 2]
+    vols = c1m[:, 4]
+
+    o, h, l, price, vol = opens[-1], highs[-1], lows[-1], closes_1m[-1], vols[-1]
+
+    # Liquidity pools: prior-bar high/low of last N bars (exclude current bar)
+    n = min(SWEEP_LOOKBACK, len(c1m) - 1)
+    pool_high = highs[-n-1:-1].max()
+    pool_low = lows[-n-1:-1].min()
+
+    # Displacement filters
+    vol_sma = sma_np(vols, 20)
+    vol_ok = vol > vol_sma[-1] * DISP_VOL_MULT if not np.isnan(vol_sma[-1]) else True
+    if not vol_ok:
+        return None
+    body_pct = abs(price - o) / price
+
+    # 1min ATR for SL buffer
     trigs = np.maximum(highs[1:] - lows[1:],
                        np.maximum(np.abs(highs[1:] - closes_1m[:-1]),
                                   np.abs(lows[1:] - closes_1m[:-1])))
     atr_val = trigs[-14:].mean() if len(trigs) >= 14 else trigs.mean()
+    buf = atr_val * 0.25
 
-    price = closes_1m[-1]
-    o = c1m[-1, 0]
-    vol = c1m[-1, 4]
+    # LONG: sweep of lows (stop hunt) + bullish displacement close back inside
+    if trend_up:
+        swept = (l < pool_low) and (price > pool_low)
+        depth_ok = (pool_low - l) / pool_low >= SWEEP_MIN_PCT
+        displ = (price > o) and (body_pct >= DISP_MIN_PCT)
+        if swept and depth_ok and displ:
+            sl = l - buf
+            risk = price - sl
+            risk_pct = risk / price
+            if MIN_STOP_PCT <= risk_pct <= MAX_STOP_PCT:
+                return ('long', price, sl, price + risk * RR_MULT)
+            return None
 
-    # Volume filter
-    vol_sma = sma_np(c1m[:, 4], 20)
-    vol_ok = vol > vol_sma[-1] * 0.8 if not np.isnan(vol_sma[-1]) else True
-    if not vol_ok:
-        return None
-
-    vwap_dist = abs(price - vwap_val) / price
-
-    # Per-asset stop/target
-    target_pct = getattr(state, 'target_pct', TARGET_PCT)
-    stop_pct = getattr(state, 'stop_pct', STOP_PCT)
-
-    # LONG
-    if (trend_up and vwap_dist < 0.0005 and
-        40 < rsi_val < 55 and price > o and price > vwap_val * 0.999):
-        sd = max(atr_val * 2, price * stop_pct * 0.5)
-        sd = min(sd, price * stop_pct)
-        return ('long', price, price - sd, price + sd * 1.5)
-
-    # SHORT
-    if (not trend_up and vwap_dist < 0.0005 and
-        45 < rsi_val < 60 and price < o and price < vwap_val * 1.001):
-        sd = max(atr_val * 2, price * stop_pct * 0.5)
-        sd = min(sd, price * stop_pct)
-        return ('short', price, price + sd, price - sd * 1.5)
+    # SHORT: sweep of highs + bearish displacement close back inside
+    if not trend_up:
+        swept = (h > pool_high) and (price < pool_high)
+        depth_ok = (h - pool_high) / pool_high >= SWEEP_MIN_PCT
+        displ = (price < o) and (body_pct >= DISP_MIN_PCT)
+        if swept and depth_ok and displ:
+            sl = h + buf
+            risk = sl - price
+            risk_pct = risk / price
+            if MIN_STOP_PCT <= risk_pct <= MAX_STOP_PCT:
+                return ('short', price, sl, price - risk * RR_MULT)
+            return None
 
     return None
 
@@ -266,7 +293,7 @@ def check_exit(state, current_candle):
             return (pos['stop'], 'stop')
         if h >= pos['target']:
             return (pos['target'], 'target')
-        if bars >= 15:
+        if bars >= 30:
             return (c, 'timeout')
         if bars >= 5:
             be = pos['entry'] * (1 + FEE_PER_SIDE * 2.5)
@@ -277,7 +304,7 @@ def check_exit(state, current_candle):
             return (pos['stop'], 'stop')
         if l <= pos['target']:
             return (pos['target'], 'target')
-        if bars >= 15:
+        if bars >= 30:
             return (c, 'timeout')
         if bars >= 5:
             be = pos['entry'] * (1 - FEE_PER_SIDE * 2.5)
@@ -300,10 +327,10 @@ class PaperBot:
             state = AssetState(pid, cfg['symbol'], cfg['name'], cfg['capital_inr'], cfg['leverage'],
                                target_pct=cfg.get('target_pct', TARGET_PCT),
                                stop_pct=cfg.get('stop_pct', STOP_PCT))
+            state.active = bool(cfg.get('enabled', True))
             self.states[pid] = state
-            tp = cfg.get('target_pct', TARGET_PCT) * 100
-            sp = cfg.get('stop_pct', STOP_PCT) * 100
-            log.info(f"  {cfg['symbol']} (id={pid}): capital={cfg['capital_inr']} INR, leverage={cfg['leverage']}x, target={tp:.2f}%, stop={sp:.2f}%")
+            status = 'ACTIVE' if state.active else 'PAUSED'
+            log.info(f"  {cfg['symbol']} (id={pid}): {status} capital={cfg['capital_inr']} INR, leverage={cfg['leverage']}x")
         return True
 
     def fetch_candles(self, state):
@@ -343,8 +370,16 @@ class PaperBot:
                 ep, reason = ex
                 self._close(state, ep, reason)
 
-        # Entry check
+        # Entry check (cooldown + max trades/day)
         if not state.position:
+            if state.cycle_count - state.last_entry_cycle < COOLDOWN_CYCLES:
+                return
+            today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+            if state.day_key != today:
+                state.day_key = today
+                state.day_count = 0
+            if state.day_count >= MAX_TRADES_PER_DAY:
+                return
             entry = check_entry(state)
             if entry:
                 d, ep, stop, target = entry
@@ -361,6 +396,8 @@ class PaperBot:
             'bars_held': 0,
         }
         log.info(f"[{state.symbol}] OPEN {direction.upper()} @ {entry:.6f} | Stop={stop:.6f} Target={target:.6f}")
+        state.last_entry_cycle = state.cycle_count
+        state.day_count += 1
 
     def _close(self, state, exit_price, reason):
         pos = state.position
@@ -435,7 +472,7 @@ def create_app():
             'status': 'running',
             'bot': 'Delta Paper Forward Test',
             'api': 'Delta Exchange India (public)',
-            'strategy': 'VWAP Pullback Scalper',
+            'strategy': 'SMC Sweep + Displacement v2 (15m bias, 2R, killzone 06-20 UTC)',
             'config': {
                 'target': 'per-asset (see assets)',
                 'stop': 'per-asset (see assets)',
