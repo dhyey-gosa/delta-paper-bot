@@ -364,6 +364,7 @@ def check_exit(state, current_candle):
     h, l, c = current_candle[1], current_candle[2], current_candle[3]
     pos['bars_held'] = pos.get('bars_held', 0) + 1
     bars = pos['bars_held']
+    entry = pos['entry']
 
     if pos['direction'] == 'long':
         if l <= pos['stop']:
@@ -372,8 +373,17 @@ def check_exit(state, current_candle):
             return (pos['target'], 'target')
         if bars >= 30:
             return (c, 'timeout')
-        if bars >= 5:
-            be = pos['entry'] * (1 + FEE_PER_SIDE * 2.5)
+        # Trailing stop: progressively lock in profit
+        risk = abs(pos['target'] - entry) / RR_MULT  # original risk
+        if bars >= 10:
+            # Trail: stop = high - 40% of risk (locks in 60% of move if hit)
+            trail_stop = h - risk * 0.40
+            if trail_stop > pos['stop']:
+                pos['stop'] = trail_stop
+                log.info(f"  TRAIL LONG: stop -> {pos['stop']:.4f} (h={h:.4f} risk={risk:.4f})")
+        elif bars >= 5:
+            # Breakeven + fees
+            be = entry * (1 + FEE_PER_SIDE * 2.5)
             if be > pos['stop']:
                 pos['stop'] = be
     else:
@@ -383,8 +393,17 @@ def check_exit(state, current_candle):
             return (pos['target'], 'target')
         if bars >= 30:
             return (c, 'timeout')
-        if bars >= 5:
-            be = pos['entry'] * (1 - FEE_PER_SIDE * 2.5)
+        # Trailing stop: progressively lock in profit
+        risk = abs(entry - pos['target']) / RR_MULT  # original risk
+        if bars >= 10:
+            # Trail: stop = low + 40% of risk (locks in 60% of move if hit)
+            trail_stop = l + risk * 0.40
+            if trail_stop < pos['stop']:
+                pos['stop'] = trail_stop
+                log.info(f"  TRAIL SHORT: stop -> {pos['stop']:.4f} (l={l:.4f} risk={risk:.4f})")
+        elif bars >= 5:
+            # Breakeven + fees
+            be = entry * (1 - FEE_PER_SIDE * 2.5)
             if be < pos['stop']:
                 pos['stop'] = be
     return None
