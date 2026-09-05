@@ -36,7 +36,15 @@ ASSETS = {
 # Strategy params (default - overridden per-asset above)
 TARGET_PCT = 0.0020   # 0.20%
 STOP_PCT = 0.0015     # 0.15%
-FEE_PER_SIDE = 0.0001  # 0.01%
+# === DELTA EXCHANGE INDIA REAL FEES (verified from delta.exchange/fees) ===
+# Crypto futures: taker 0.05% / maker 0.02%. Gold&Silver promo: 0.01% both sides.
+# +18% GST on all fees. Round-trip on 5000 INR notional (100 x 50x):
+#   crypto taker = 5.90 INR, crypto maker = 2.36 INR, gold = 1.18 INR
+EXECUTION = 'taker'  # 'taker' = market orders (honest default). 'maker' = limit orders (cheaper, miss fills)
+TAKER_FEE = 0.0005 * 1.18   # 0.059% per side, incl GST
+MAKER_FEE = 0.0002 * 1.18   # 0.0236% per side, incl GST
+GOLD_FEE = 0.0001 * 1.18    # 0.0118% per side, incl GST (XAUT/SLV promo)
+GOLD_SYMBOLS = {'XAUTUSD', 'SLVONUSD', 'PAXGUSD'}
 COOLDOWN_BARS = 0
 
 # === SMC/ICT-lite v2 (sweep + displacement + 2R) ===
@@ -44,7 +52,9 @@ SWEEP_LOOKBACK = 20      # liquidity pool = highest high / lowest low of last N 
 SWEEP_MIN_PCT = 0.0003   # wick must exceed pool by >= 0.03% to count as a sweep
 DISP_MIN_PCT = 0.0005    # displacement body >= 0.05%
 DISP_VOL_MULT = 1.1      # displacement volume > 1.1x SMA20
-MIN_STOP_PCT = 0.0002    # skip trade if structure stop < 0.02% (still meaningful at 50x: 1% risk)
+MIN_STOP_PCT = 0.0015    # BACKTEST-VERIFIED (fee_honest_backtest v2, 12mo BTC+XAU):
+                        # stops < 0.15% can never survive fee drag. Only XAU Bm2 (min-stop
+                        # 0.15%, 2R) was green OOS. Dust-scalps are banned by this line.
 MAX_STOP_PCT = 0.008     # skip trade if structure stop > 0.80% (too much risk)
 RR_MULT = 2.0            # target = 2R
 KILLZONE_START = 6       # UTC hour: trade only 06:00-20:00 (London/NY gold hours)
@@ -365,6 +375,7 @@ def check_exit(state, current_candle):
     pos['bars_held'] = pos.get('bars_held', 0) + 1
     bars = pos['bars_held']
     entry = pos['entry']
+    fr = pos.get('fee_rate', TAKER_FEE)  # real per-side fee incl GST
 
     if pos['direction'] == 'long':
         if l <= pos['stop']:
@@ -383,7 +394,7 @@ def check_exit(state, current_candle):
                 log.info(f"  TRAIL LONG: stop -> {pos['stop']:.4f} (h={h:.4f} risk={risk:.4f})")
         elif bars >= 5:
             # Breakeven + fees
-            be = entry * (1 + FEE_PER_SIDE * 2.5)
+            be = entry * (1 + fr * 2.5)
             if be > pos['stop']:
                 pos['stop'] = be
     else:
@@ -403,7 +414,7 @@ def check_exit(state, current_candle):
                 log.info(f"  TRAIL SHORT: stop -> {pos['stop']:.4f} (l={l:.4f} risk={risk:.4f})")
         elif bars >= 5:
             # Breakeven + fees
-            be = entry * (1 - FEE_PER_SIDE * 2.5)
+            be = entry * (1 - fr * 2.5)
             if be < pos['stop']:
                 pos['stop'] = be
     return None
@@ -493,13 +504,20 @@ class PaperBot:
                          f"KZ={in_zone} candles1m={len(state.candles_1m)} candles15m={len(state.candles_15m)}")
 
     def _open(self, state, direction, entry, stop, target):
-        notional = state.capital * state.leverage * 0.5
+        # Full-size notional: capital * leverage (matches real trading).
+        # P&L math below uses leverage*capital so fees MUST use same base.
+        notional = state.capital * state.leverage
+        if state.symbol in GOLD_SYMBOLS:
+            fee_rate = GOLD_FEE
+        else:
+            fee_rate = MAKER_FEE if EXECUTION == 'maker' else TAKER_FEE
         state.position = {
             'direction': direction,
             'entry': entry,
             'stop': stop,
             'target': target,
             'notional': notional,
+            'fee_rate': fee_rate,
             'bars_held': 0,
         }
         log.info(f"[{state.symbol}] OPEN {direction.upper()} @ {entry:.6f} | Stop={stop:.6f} Target={target:.6f}")
@@ -514,7 +532,7 @@ class PaperBot:
             pnl_pct = (pos['entry'] - exit_price) / pos['entry']
         pnl_pct *= state.leverage
         pnl_inr = pnl_pct * state.capital
-        fees = pos['notional'] * FEE_PER_SIDE * 2
+        fees = pos['notional'] * pos.get('fee_rate', TAKER_FEE) * 2
         pnl_net = pnl_inr - fees
 
         state.capital += pnl_net
@@ -595,7 +613,7 @@ def create_app():
                 'target': 'per-asset (see assets)',
                 'stop': 'per-asset (see assets)',
                 'leverage': '50x',
-                'fees': f'{FEE_PER_SIDE*100:.2f}%/side',
+                'fees': f'taker {TAKER_FEE*100:.3f}%/side, maker {MAKER_FEE*100:.4f}%/side, gold {GOLD_FEE*100:.4f}%/side (all +GST incl), exec={EXECUTION}',
                 'capital_per_asset': '100 INR',
             },
             'uptime_since': b.start_time,
